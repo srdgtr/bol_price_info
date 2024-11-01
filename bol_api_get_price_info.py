@@ -2,6 +2,7 @@ import asyncio
 import configparser
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime
@@ -98,7 +99,7 @@ class BOL_API:
         # request the JWT
         try:
             # request an access token
-            print(f"{datetime.now().strftime('%c')} token_refreshing")
+            # print(f"{datetime.now().strftime('%c')} token_refreshing")
             init_request = httpx.post(self.host, auth=(self.key, self.secret))
             init_request.raise_for_status()
         except Exception as e:
@@ -132,9 +133,12 @@ class BOL_API:
         response = await session.get(url, headers=self.access_token)
         # remaining_requests = int(response.headers.get("x-ratelimit-remaining", 1))
         time_to_sleep = 60
-        if response.headers.get("x-ratelimit-reset"):
+        if int(response.headers.get("x-ratelimit-remaining")) < 50:
+            # print(response.headers.get("x-ratelimit-reset"))
+            # print(f"{response.headers.get('x-ratelimit-remaining')} Remaining")
+            limit_left = (int(response.headers.get("x-ratelimit-remaining")))
             time_to_sleep = (int(response.headers.get("x-ratelimit-reset")))
-            if time_to_sleep < 2:
+            if limit_left < 10:
                 print(f"to fast {time_to_sleep} seconds...")
                 await asyncio.sleep(time_to_sleep*2)
         if response.status_code in (429,):
@@ -150,11 +154,11 @@ class BOL_API:
 
 
     async def process_bol_competing_prices_prices(self,eans):
-        timeout = httpx.Timeout(240)
+        timeout = httpx.Timeout(250)
         async with httpx.AsyncClient(timeout=timeout) as client:
-            rate_limiter = StrictLimiter(12) # Limit to MAX 900 a minute concurrent requests
+            rate_limiter = StrictLimiter(890/60) # Limit to MAX 900 a minute concurrent requests
             tasks = [asyncio.create_task(self.fetch_items_bol(client,f"{ini_config.get('bol_api_urls','base_url')}/products/{str(ean['ean']).zfill(13)}/offers?condition=NEW",ean,rate_limiter)) for ean in eans]
-            product_prices_bol = await asyncio.gather(*tasks)
+            product_prices_bol = await asyncio.gather(*tasks, return_exceptions=True)
             respose_list_bol_info = []
             for ean, bol_offers in product_prices_bol:
                 offer_nr = 1
@@ -181,18 +185,21 @@ class BOL_API:
                         else:
                             response_bol_info.update({f"{key}": value for key, value in base_info.items()})
                         offer_nr += 1
-                    respose_list_bol_info.append(response_bol_info)
                     
                 elif bol_offers.get('status') in (400, 404):
                     response_bol_info["ean"] = int(ean.get("ean"))
-                    response_bol_info["bol_price_error"] = bol_offers['violations'][0]["reason"]
+                    try: # 99% of cases it will be invalid ean
+                        response_bol_info["bol_price_error"] = f"Invalid bol ean: {re.search(r'[0-9]+', bol_offers['violations'][0]['reason']).group(0)}"
+                    except AttributeError:
+                        response_bol_info["bol_price_error"] = bol_offers['violations'][0]["reason"]
                 else:
                     response_bol_info["ean"] = int(ean.get("ean"))
-                    response_bol_info["bol_price_error"] = None
+                    response_bol_info["bol_price_error"] = "geen kook"
+                respose_list_bol_info.append(response_bol_info)
                 with engine.connect() as conn:
                     conn.execute(insert(price_info).values(**response_bol_info))
                     conn.commit()
-            return pd.DataFrame(respose_list_bol_info)
+            return respose_list_bol_info
 
 # verkrijgen alle ean nummers
 ean_basis_path = Path.home() / "ean_numbers_basisfiles"
@@ -204,8 +211,11 @@ alle_eans_uit_basisbestand = pd.read_csv(
 ean_from_basis_file_unique = alle_eans_uit_basisbestand.astype(str).query('ean.str.len() > 8').query("~ean.str.contains('-')").drop_duplicates()
 
 # voor testen, klein aantal nummers
-# ean_from_basis_file_unique = ean_from_basis_file_unique[:1000]
-# ean_from_basis_file_unique = pd.DataFrame(["8711295239717","4012074002541","5025232952700"], columns=['ean'])
+# ean_from_basis_file_unique = ean_from_basis_file_unique[:200]
+
+# ean_from_basis_file_unique = pd.DataFrame(["7702018311422","4012074002541","5025232952700"], columns=['ean'])
+
+# print(ean_from_basis_file_unique.query('ean == "7702018311422"'))
 
 first_shop= list(ini_config["bol_winkels_api"].keys())[1]
 client_id, client_secret,_,_ = [x.strip() for x in ini_config.get("bol_winkels_api", first_shop).split(",")]
@@ -234,6 +244,7 @@ ean_basis = (
             "Levertijd (in tekst)",
             "Exclusief",
             "Exclusief-prijs",
+            "Richtprijs Exclusief-prijs",
         ],
         engine="openpyxl",
     )
