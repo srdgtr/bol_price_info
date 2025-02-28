@@ -1,24 +1,43 @@
 import asyncio
 import configparser
 import json
+import logging
 import os
 import re
 import sys
 import time
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
-
-from asynciolimiter import StrictLimiter
+from typing import Dict
 import dropbox
 import numpy as np
 import pandas as pd
 import httpx
-from sqlalchemy import TEXT, URL, BigInteger, Boolean, Column, Float, Integer, MetaData, String, Table, create_engine, insert
+from httpx_limiter import AsyncRateLimitedTransport
+from sqlalchemy import (
+    TEXT,
+    URL,
+    BigInteger,
+    Boolean,
+    Column,
+    Float,
+    Integer,
+    MetaData,
+    String,
+    Table,
+    create_engine,
+    insert,
+    text,
+)
 
 date_now = datetime.now().strftime("%c").replace(":", "-")
-ini_config = configparser.ConfigParser()
+ini_config = configparser.ConfigParser(interpolation=None)
 ini_config.read(Path.home() / "bol_export_files.ini")
-dbx = dropbox.Dropbox(os.environ.get("DROPBOX"))
+
+try:
+    dbx = dropbox.Dropbox(os.environ.get("DROPBOX"))
+except Exception:
+    dbx = dropbox.Dropbox(ini_config.get("dropbox", "api_dropbox"))
 
 config_db = dict(
     drivername="mariadb",
@@ -33,6 +52,14 @@ engine = create_engine(URL.create(**config_db))
 conn = engine.connect()
 metadata = MetaData()
 
+logger = logging.getLogger("price_info")
+logging.basicConfig(
+    filename=f"price_info_bol_" + date.today().strftime("%V") + ".log",
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)  # nieuwe log elke week
+logging.getLogger("googleapiclient.discovery_cache").setLevel(logging.ERROR)
+
 price_info = Table(
     "bol_price_info",
     metadata,
@@ -41,30 +68,29 @@ price_info = Table(
     Column("prijs_bol", Float(20, 2)),
     Column("retailerId", Integer()),
     Column("countryCode", String(3)),
-    Column("bestOffer", Boolean()), 
+    Column("bestOffer", Boolean()),
     Column("fulfilmentMethod", TEXT(3)),
-    Column("condition", TEXT(10)),
     Column("ultimateOrderTime", TEXT(10)),
     Column("minDeliveryDate", TEXT(15)),
     Column("maxDeliveryDate", TEXT(15)),
     Column("bol_price_error", TEXT(70)),
+    Column("not_found_ean", Boolean()),
+    Column("invalid_ean", Boolean()),
     # * max 40 omdat er bij bol 40 prijzen kunnen zijn
     *[
         col
-        for i in range(2, 40)
+        for i in range(1, 25)
         for col in (
-            Column(f"ean_{i}", BigInteger(), autoincrement=False),
             Column(f"prijs_bol_{i}", Float(20, 2)),
             Column(f"retailerId_{i}", Integer()),
             Column(f"countryCode_{i}", String(3)),
             Column(f"bestOffer_{i}", Boolean()),
             Column(f"fulfilmentMethod_{i}", TEXT(3)),
-            Column(f"condition_{i}", TEXT(10)),
             Column(f"ultimateOrderTime_{i}", TEXT(10)),
             Column(f"minDeliveryDate_{i}", TEXT(15)),
-            Column(f"maxDeliveryDate_{i}", TEXT(15))
+            Column(f"maxDeliveryDate_{i}", TEXT(15)),
         )
-    ]
+    ],
 )
 metadata.drop_all(engine)
 
@@ -72,14 +98,12 @@ metadata.create_all(engine)
 
 class BOL_API:
     host = None
-    key = None
+    key = None 
     secret = None
     access_token = None
     access_token_expiration = None
-    total_requested = 0
-    
 
-    def __init__(self, host, key, secret):
+    def __init__(self, host: str, key: str, secret: str):
         # set init values on creation
         self.host = host
         self.key = key
@@ -90,20 +114,19 @@ class BOL_API:
             if self.access_token is None:
                 raise Exception("Request for access token failed.")
         except Exception as e:
-            print(e)
+            logging.error(e)
             sys.exit()
         else:
             self.access_token_expiration = time.time() + 250
 
-    def getAccessToken(self):
+    def getAccessToken(self) -> Dict[str, str]:
         # request the JWT
         try:
             # request an access token
-            # print(f"{datetime.now().strftime('%c')} token_refreshing")
             init_request = httpx.post(self.host, auth=(self.key, self.secret))
             init_request.raise_for_status()
         except Exception as e:
-            print(e)
+            logging.error(e)
             return None
         else:
             token = json.loads(init_request.text)["access_token"]
@@ -117,6 +140,12 @@ class BOL_API:
             self.access_token_expiration = time.time() + 250
             return post_header
 
+    def refresh_token(self):
+        self.access_token = self.getAccessToken()
+        if self.access_token is None:
+            raise Exception("Failed to refresh access token.")
+        logging.info("Token refreshed successfully")
+
     class Decorators:
         @staticmethod
         def refreshToken(decorated):
@@ -128,103 +157,96 @@ class BOL_API:
             return wrapper
 
     @Decorators.refreshToken
-    async def make_api_get_requests_bol(self,session, url,rate_limiter):
-        await rate_limiter.wait()
-        response = await session.get(url, headers=self.access_token)
-        # remaining_requests = int(response.headers.get("x-ratelimit-remaining", 1))
-        time_to_sleep = 60
-        if int(response.headers.get("x-ratelimit-remaining")) < 50:
-            # print(response.headers.get("x-ratelimit-reset"))
-            # print(f"{response.headers.get('x-ratelimit-remaining')} Remaining")
-            limit_left = (int(response.headers.get("x-ratelimit-remaining")))
-            time_to_sleep = (int(response.headers.get("x-ratelimit-reset")))
-            if limit_left < 10:
-                print(f"to fast {time_to_sleep} seconds...")
+    async def fetch_prices_others(self, client, ean):
+        try:
+            response = await client.get(
+                f"{ini_config.get('bol_api_urls','base_url')}/products/{ean}/offers?condition=NEW",
+                headers=self.access_token,
+            )
+            response.raise_for_status()
+            return response
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 401:
+                logging.info("Token expired, refreshing token...")
+                self.refresh_token()
+                client.headers = self.access_token
+                return await self.fetch_prices_others(client, ean)  # Retry
+            logging.error(f"Error for EAN {ean}: {exc.response}")
+            if exc.response.status_code == 429:
+                time_to_sleep = int(response.headers.get("retry-after", 60))
                 await asyncio.sleep(time_to_sleep*2)
-        if response.status_code in (429,):
-            print(f"Rate limit exceeded. Retrying in {time_to_sleep} seconds...")
-            await asyncio.sleep(time_to_sleep)
-            return await self.make_api_get_requests_bol(session, url)
-        return response.json()
-
-    async def fetch_items_bol(self,session,url,product_id,rate_limiter):
-        # print(f"{datetime.now().strftime('%c')} new second")
-        bol_result = await self.make_api_get_requests_bol(session, url,rate_limiter)
-        return product_id, bol_result
+                logging.info("to much requests at same time, try again")
+                return await self.fetch_prices_others(client, ean)
+            return response
+        except httpx.ReadError as exc:
+            logging.error(f"read error for EAN {ean}: {exc}")
 
 
-    async def process_bol_competing_prices_prices(self,eans):
-        timeout = httpx.Timeout(250)
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            rate_limiter = StrictLimiter(890/60) # Limit to MAX 900 a minute concurrent requests
-            tasks = [asyncio.create_task(self.fetch_items_bol(client,f"{ini_config.get('bol_api_urls','base_url')}/products/{str(ean['ean']).zfill(13)}/offers?condition=NEW",ean,rate_limiter)) for ean in eans]
-            product_prices_bol = await asyncio.gather(*tasks, return_exceptions=True)
-            respose_list_bol_info = []
-            for ean, bol_offers in product_prices_bol:
-                offer_nr = 1
-                response_bol_info = {}
-                if bol_offers.get("offers"):
-                    sorted_prices = sorted(sorted(bol_offers["offers"], key=lambda x: x['price']), key=lambda x: not x['bestOffer'])
+    @Decorators.refreshToken
+    async def get_prices_others_bol(self):
+        with engine.connect() as connection:
+            all_eans = (
+                connection.execute(text(f"SELECT CAST(ean AS INTEGER) AS ean FROM unieke_eans")).mappings().all()
+            )#[7500:8000]
+        ean_to_response = {}
+        timeout = httpx.Timeout(240)
+        async with httpx.AsyncClient(timeout=timeout, transport=AsyncRateLimitedTransport.create(rate=900 / 60, capacity=50)) as client:
+            ean_to_response = {}
+            for row in all_eans:
+                ean = str(row.get("ean", "")).zfill(13)
+                response = await self.fetch_prices_others(client, ean)
+                ean_to_response[ean] = response
+
+            data_list = []
+            for ean, response in ean_to_response.items():
+                offer_nr = 1 #start from 2 as the first shop should be without number
+                data = {"ean": int(ean)}
+                response_data = response.json()
+                if response_data.get("offers"):
+                    sorted_prices = sorted(
+                        sorted(response_data["offers"], key=lambda x: x["price"]),
+                        key=lambda x: not x["bestOffer"],
+                    )
                     for bol_pricing in sorted_prices:
-                        if offer_nr == 40:
+                        if offer_nr == 24:
                             break
                         base_info = {
-                            "ean": int(ean.get("ean")),
-                            "prijs_bol": bol_pricing.get("price"),
-                            "retailerId": bol_pricing.get("retailerId"),
-                            "countryCode": bol_pricing.get("countryCode"),
-                            "bestOffer": bol_pricing.get("bestOffer"),
+                            "prijs_bol": bol_pricing.get("price", 0.0),
+                            "retailerId": bol_pricing.get("retailerId",""),
+                            "countryCode": bol_pricing.get("countryCode",""),
+                            "bestOffer": bol_pricing.get("bestOffer",False),
                             "fulfilmentMethod": bol_pricing.get("fulfilmentMethod"),
-                            "condition": bol_pricing.get("condition"),
                             "ultimateOrderTime": bol_pricing.get("ultimateOrderTime"),
                             "minDeliveryDate": bol_pricing.get("minDeliveryDate"),
                             "maxDeliveryDate": bol_pricing.get("maxDeliveryDate"),
                         }
                         if bol_pricing.get("bestOffer") != True:
-                            response_bol_info.update({f"{key}_{offer_nr}": value for key, value in base_info.items()})
+                            data.update({f"{key}_{offer_nr}": value for key, value in base_info.items()})
                         else:
-                            response_bol_info.update({f"{key}": value for key, value in base_info.items()})
+                            data.update({f"{key}": value for key, value in base_info.items()})
                         offer_nr += 1
-                    
-                elif bol_offers.get('status') in (400, 404):
-                    response_bol_info["ean"] = int(ean.get("ean"))
-                    try: # 99% of cases it will be invalid ean
-                        response_bol_info["bol_price_error"] = f"Invalid bol ean: {re.search(r'[0-9]+', bol_offers['violations'][0]['reason']).group(0)}"
-                    except AttributeError:
-                        response_bol_info["bol_price_error"] = bol_offers['violations'][0]["reason"]
+
+                elif response.status_code in (400, 404):
+                    status_message = "Invalid EAN" if response.status_code == 400 else "Product not found"
+                    logging.info(f"{status_message} for EAN {ean}")
+                    data[f"{'invalid' if response.status_code == 400 else 'not_found'}_ean"] = True  # Dynamic key
                 else:
-                    response_bol_info["ean"] = int(ean.get("ean"))
-                    response_bol_info["bol_price_error"] = "geen kook"
-                respose_list_bol_info.append(response_bol_info)
+                    logging.info(f"Failed to receive data for EAN {ean}: {response.status_code} - {response.text}")
+
+                data_list.append(data)
+                
                 with engine.connect() as conn:
-                    conn.execute(insert(price_info).values(**response_bol_info))
+                    conn.execute(insert(price_info).values(**data))
                     conn.commit()
-            return respose_list_bol_info
+            return data_list
 
-# verkrijgen alle ean nummers
 ean_basis_path = Path.home() / "ean_numbers_basisfiles"
-alle_eans_uit_basisbestand = pd.read_csv(
-    max(ean_basis_path.glob("ean_numbers_basis_*.csv"), key=os.path.getctime,),
-    usecols=["ean"],
-)
+first_shop = list(ini_config["bol_winkels_api"].keys())[2]
+client_id, client_secret, _, _ = [x.strip() for x in ini_config.get("bol_winkels_api", first_shop).split(",")]
+bol_api = BOL_API(ini_config["bol_api_urls"]["authorize_url"], client_id, client_secret)
+get_bol_allowable_price = asyncio.run(bol_api.get_prices_others_bol())
 
-ean_from_basis_file_unique = alle_eans_uit_basisbestand.astype(str).query('ean.str.len() > 8').query("~ean.str.contains('-')").drop_duplicates()
-
-# voor testen, klein aantal nummers
-# ean_from_basis_file_unique = ean_from_basis_file_unique[:200]
-
-# ean_from_basis_file_unique = pd.DataFrame(["7702018311422","4012074002541","5025232952700"], columns=['ean'])
-
-# print(ean_from_basis_file_unique.query('ean == "7702018311422"'))
-
-first_shop= list(ini_config["bol_winkels_api"].keys())[1]
-client_id, client_secret,_,_ = [x.strip() for x in ini_config.get("bol_winkels_api", first_shop).split(",")]
-
-bol_call_upload = BOL_API(ini_config["bol_api_urls"]["authorize_url"], client_id, client_secret)
-
-get_bol_allowable_price = asyncio.run(bol_call_upload.process_bol_competing_prices_prices(ean_from_basis_file_unique.to_dict("records")))
-
-get_bol_competition_price_totaal = pd.DataFrame(get_bol_allowable_price).assign(ean = lambda x : x['ean'].astype(str))
+get_bol_competition_price_totaal = pd.DataFrame(get_bol_allowable_price).assign(ean=lambda x: x["ean"].astype(str))
 get_bol_competition_price_totaal.to_csv(f"bol_competition_prices_{date_now}.csv", index=False)
 
 ean_basis = (
@@ -244,7 +266,9 @@ ean_basis = (
             "Levertijd (in tekst)",
             "Exclusief",
             "Exclusief-prijs",
-            "Richtprijs Exclusief-prijs",
+            "Richtprijs handmatig",
+            "Fabrikant",
+            "economic_operators",
         ],
         engine="openpyxl",
     )
@@ -267,6 +291,7 @@ ftp_has_run = Path.cwd() / "is_bol_ftp_uitgevoerd.txt"
 
 with open(ftp_has_run, "rb") as f:
     dbx.files_upload(
-        f.read(), "/macro/datafiles/PriceList/" + ftp_has_run.name, mode=dropbox.files.WriteMode("overwrite", None)
+        f.read(),
+        "/macro/datafiles/PriceList/" + ftp_has_run.name,
+        mode=dropbox.files.WriteMode("overwrite", None),
     )
-
