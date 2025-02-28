@@ -65,7 +65,7 @@ price_info = Table(
     metadata,
     # basis kolomen
     Column("ean", BigInteger(), primary_key=True, autoincrement=False),
-    Column("prijs_bol", Float(20, 2)),
+    Column("bol_price", Float(20, 2)),
     Column("retailerId", Integer()),
     Column("countryCode", String(3)),
     Column("bestOffer", Boolean()),
@@ -81,7 +81,7 @@ price_info = Table(
         col
         for i in range(1, 25)
         for col in (
-            Column(f"prijs_bol_{i}", Float(20, 2)),
+            Column(f"bol_price_{i}", Float(20, 2)),
             Column(f"retailerId_{i}", Integer()),
             Column(f"countryCode_{i}", String(3)),
             Column(f"bestOffer_{i}", Boolean()),
@@ -211,7 +211,7 @@ class BOL_API:
                         if offer_nr == 24:
                             break
                         base_info = {
-                            "prijs_bol": bol_pricing.get("price", 0.0),
+                            "bol_price": bol_pricing.get("price", 0.0),
                             "retailerId": bol_pricing.get("retailerId",""),
                             "countryCode": bol_pricing.get("countryCode",""),
                             "bestOffer": bol_pricing.get("bestOffer",False),
